@@ -1,0 +1,164 @@
+/**
+ * Stm provides software transactional memory support for CAL, modelled on Haskell's STM functions.
+ */
+module Org.Kablambda.Stm;
+
+import Cal.Core.Prelude using
+    dataConstructor = True;
+    function =
+        deepStrict, id, input, makeCalFunction, output, outputCalValueStrict,
+        seq, toCalValue, unsafeCoerce, unsafeFromCalValue;
+    typeConstructor = Boolean, CalFunction, CalValue, JObject, Long, String;
+    typeClass = Outputable;
+    ;
+
+import Cal.Experimental.Concurrent.Parallel using
+    function = parallelMap;
+    ;
+
+import Cal.Core.Debug using
+    function = setTraceShowsThreadName, trace;
+    typeClass = Show;
+    ;
+
+import Cal.Core.Monad using
+    typeClass = Monad;
+    function = bind, return;
+    ;
+
+import Cal.Core.Functor using
+    typeClass = Functor;
+    ;
+
+import Cal.Core.Exception using
+    function = catch, throw;
+    typeConstructor = JThrowable;
+    typeClass = Exception;
+    ;
+
+import Org.Kablambda.IO using
+    typeConstructor = IO;
+    dataConstructor = IO;
+    ;
+
+data foreign unsafe import jvm "org.kablambda.calverse.TVar" JTVar;
+data foreign unsafe import jvm "org.multiverse.templates.OrElseTemplate" OrElseTemplate;
+data foreign unsafe import jvm "org.multiverse.api.Transaction" Transaction;
+foreign unsafe import jvm "method get" private getValue :: JTVar -> Transaction -> JObject;
+foreign unsafe import jvm "method toString" private jShowTVar :: JTVar -> String;
+foreign unsafe import jvm "method set" private setValue :: JTVar -> Transaction -> JObject -> ();
+foreign unsafe import jvm "static method org.kablambda.calverse.StmRuntime.atomically" private jAtomically :: CalFunction -> CalValue;
+foreign unsafe import jvm "static method org.kablambda.calverse.StmRuntime.orElse" private jOrElse :: CalFunction -> CalFunction -> Transaction -> CalValue;
+foreign unsafe import jvm "static method org.kablambda.calverse.StmRuntime.jNewNamedTVar" private jNewNamedTVar :: Transaction -> JObject -> String -> JTVar;
+foreign unsafe import jvm "static method org.kablambda.calverse.StmRuntime.jNewUnsafeNamedTVar" private jNewUnsafeNamedTVar :: JObject -> String -> JTVar;
+//foreign unsafe import jvm "static method tdavies.cal.stm.CalStmSupport.jNewUnsafeNamedRootTVar" private jNewUnsafeNamedRootTVar :: Long -> JObject -> String -> JTVar;
+foreign unsafe import jvm "static method org.kablambda.calverse.StmRuntime.jRetry" private jRetry :: Transaction -> String -> ();
+//foreign unsafe import jvm "static method tdavies.cal.stm.CalStmSupport.useBDB" public useBDB :: String -> String -> ();
+
+
+data public STM a = public STM f :: !(Transaction -> (Transaction, a));
+
+// we wrap the JTVar instance in order to provide a type parameter
+data public TVar a = public TVar jtvar :: !JTVar;
+
+instance Show (TVar a) where
+    show = showTVar;
+    ;
+
+showTVar t = let TVar jtvar = t; in jShowTVar jtvar;
+
+instance Functor STM where
+    map = mapSTM;
+    ;
+
+mapSTM :: (a -> b) -> (STM a -> STM b);
+mapSTM f x = x `bind` (return # f);
+
+instance Monad STM where
+    bind = bindSTM;
+    anonymousBind = anonymousBindSTM;
+    return = returnSTM;
+    ;
+
+bindSTM :: STM a -> (a -> STM b) -> STM b;
+bindSTM m f =
+    let STM mf = m;
+    in
+        STM (\s -> 
+            let
+                (newState, a) = mf s;
+            in
+                (f a).STM.f newState
+            );
+
+anonymousBindSTM :: STM a -> STM b -> STM b;
+anonymousBindSTM a b =
+    let STM fa = a;
+        STM fb = b;
+    in
+        STM (\s ->
+            let (newState, a) = fa s;
+            in a `seq` fb newState
+            );
+
+returnSTM :: a -> STM a;
+returnSTM a = STM (\s -> (s,a));
+
+coerceJObject :: JObject -> a;
+coerceJObject j = unsafeFromCalValue ((input j) :: CalValue);
+
+toStrictJObject :: a -> JObject;
+toStrictJObject v = (outputCalValueStrict # toCalValue) (deepStrict id v);
+
+createTVar :: Transaction -> a -> TVar a;
+createTVar t !v = TVar $ jNewNamedTVar t (toStrictJObject v) "";
+
+createNamedTVar :: Transaction -> a -> String -> TVar a;
+createNamedTVar l !v !n = TVar $ jNewNamedTVar l (toStrictJObject v) n;
+
+newTVar :: a -> STM (TVar a);
+public newTVar !v = STM (\s -> (s, createTVar s v));
+
+newNamedTVar :: a -> String -> STM (TVar a);
+public newNamedTVar !v !name = STM (\s -> (s, createNamedTVar s v name));
+
+newUnsafeNamedTVar :: a -> String -> TVar a;
+public newUnsafeNamedTVar !v !name = TVar $ jNewUnsafeNamedTVar (toStrictJObject v) name;
+
+newUnsafeTVar :: a ->  TVar a;
+public newUnsafeTVar !v = TVar $ jNewUnsafeNamedTVar (toStrictJObject v) "";
+
+//newUnsafeRootTVar :: Long -> a -> TVar a;
+//public newUnsafeRootTVar !id !v = TVar $ jNewUnsafeNamedRootTVar id (toStrictJObject v) "";
+
+readTVar :: TVar a -> STM a;
+public readTVar !t = let TVar jt = t; in STM (\s -> (s, coerceJObject $ getValue jt s));
+
+writeTVar :: TVar a -> a -> STM ();
+public writeTVar !t !a = let TVar jt = t; in STM (\s -> (s, setValue jt s (toStrictJObject a)));
+
+retryBecause :: String -> STM ();
+public retryBecause reason = STM (\s -> (s, jRetry s reason));
+
+retry :: STM ();
+public retry = retryBecause "";
+
+checkBecause :: String -> Boolean -> STM ();
+public checkBecause reason !b = STM (\s -> (s, (if b then () else jRetry s reason)));
+
+check :: Boolean -> STM ();
+public check = checkBecause "";
+
+wrapSTM :: STM a -> CalFunction;
+private wrapSTM !stm = 
+        makeCalFunction
+            (\!tx -> let (_, a) = stm.STM.f $ unsafeCoerce tx;
+                     in toStrictJObject a);
+    
+orElse :: STM a -> STM a -> STM a;
+public orElse !a1 !a2 = STM (\s -> (s, unsafeCoerce $ (jOrElse (wrapSTM a1) (wrapSTM a2) s)));
+
+atomically :: STM a -> IO a;
+public atomically !act = 
+    IO (\s -> (s,(unsafeCoerce $ jAtomically (wrapSTM act))));
+    

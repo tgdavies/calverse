@@ -1,0 +1,1 @@
+This integrates [CAL/OpenQuark](http://github.com/levans/Open-Quark) with [Multiverse STM](http://code.google.com/p/multiverse/).

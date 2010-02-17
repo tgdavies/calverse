@@ -1,0 +1,315 @@
+module Org.Kablambda.StmTest;
+
+import Cal.Core.Prelude using
+    typeConstructor = Boolean, Int, String;
+    function = abs, const, deepSeq, seq, upFromTo;
+    dataConstructor = False, True;
+    ;
+
+import Org.Kablambda.Stm using
+    typeConstructor = STM, TVar;
+    function =
+        atomically, check, checkBecause, newNamedTVar, newTVar, newUnsafeTVar,
+        orElse, readTVar, retry, writeTVar;
+    ;
+
+import Cal.Core.Monad using
+    function = anonymousBind, bind, return, sequence;
+    ;
+
+import Cal.Core.Debug using
+    typeClass = Show;
+    function = getSystemTime, show, sleep, trace;
+    ;
+
+import Cal.Collections.List using
+    function = head, length, map, repeat, strictList, subscript, sum, take;
+    ;
+
+import Cal.Experimental.Concurrent.Parallel using
+    function = par, parallelMap, threadPerTaskExecutor;
+    ;
+
+import Cal.Utilities.Random using
+    function = randomBoundedInts, randomLongs;
+    ;
+
+import Org.Kablambda.IO using
+    function = putStr, runIO;
+    typeConstructor = IO;
+    dataConstructor = IO;
+    ;
+
+import Org.Kablambda.Logger using
+    function = logFINEST, logWARNING, setLogLevel;
+    ;
+
+import Org.Kablambda.Concurrent using
+    function = setCurrentThreadName;
+    ;
+
+data Account = Account value :: !(TVar Int) deriving Show;
+
+getValue :: Account -> STM Int;
+getValue a = let Account tv = a; in readTVar tv;
+
+transfer :: Account -> Account -> Int -> IO ();
+transfer from to amount =
+    atomically (deposit to amount `anonymousBind` withdraw from amount);
+
+transferNoOD :: Account -> Account -> Int -> IO ();
+transferNoOD from to amount =
+    atomically (getValue from `bind` (\v ->
+        check (v >= amount)) `anonymousBind`
+        deposit to amount `anonymousBind`
+        withdraw from amount);
+
+newvalue :: Account -> Int -> STM ();
+newvalue !account !amount =
+    let Account tvar = account; in writeTVar tvar amount;
+
+deposit :: Account -> Int -> STM ();
+deposit !account amount = 
+    let Account tvar = account; in (readTVar tvar) `bind` (\balance -> writeTVar tvar (balance + amount));
+
+withdraw :: Account -> Int -> STM ();
+withdraw account amount = deposit account (-amount);
+
+newAccount :: Int -> STM Account;
+newAccount v = newTVar v `bind` (\tv -> return (Account tv));
+
+newAccounts :: Int -> (Int -> Int) -> IO [Account];
+newAccounts n valueFn =
+    if n == 0 then return [] 
+    else (atomically (newAccount (valueFn n)) `bind` (\a -> newAccounts (n-1) valueFn `bind` (\as -> return (a : as))));
+
+sumAccounts :: [Account] -> IO Int;
+sumAccounts accounts =
+    case accounts of
+        [] -> return 0;
+        a:as -> (atomically (getValue a) `bind` (\v ->
+                   sumAccounts as `bind` (\vs -> return (vs+v))));
+    ;
+
+testSimpleTransfer :: IO ();
+testSimpleTransfer =
+    atomically (
+        newAccount 0 `bind` (\from ->
+        newAccount 0 `bind` (\to ->
+        return (from,to)))
+    ) `bind` (\accounts -> let (from,to) = accounts; in transfer from to 100 `anonymousBind` putStr (show [from,to]));
+
+testTransfer :: (Int -> Int) -> (Account -> Account -> Int -> IO ()) -> IO Int;
+testTransfer valueFn transferFn = 
+    let
+        noOfAccounts = 10 :: Int;
+        doTransfers :: [Account] -> TVar Int -> IO ();
+        doTransfers accounts incomplete =
+            case accounts of
+                a:as -> if length as == 0 then return () else
+                    let from = subscript accounts 0;
+                        to = subscript accounts 1;
+                    in  par (runIO (transferFn from to 100 `anonymousBind`
+                                 atomically (readTVar incomplete `bind` (\n -> writeTVar incomplete (n-1))))) 
+                            (doTransfers as incomplete);
+            ;
+    in
+        (atomically (newTVar (noOfAccounts-1)) `bind` (\incomplete ->
+            newAccounts noOfAccounts valueFn `bind` (\accounts -> 
+            doTransfers accounts incomplete `anonymousBind`
+            atomically (readTVar incomplete `bind` (\n -> check (n == 0))) `anonymousBind`
+            sumAccounts accounts)));
+
+testTransfer1 = testTransfer (const 0) transfer;
+
+testTransfer2 = testTransfer (\n -> if n == 10 then 100 else 0) transferNoOD;
+
+testRunIO = runIO (putStr "Test");
+
+testAtomic = runIO $ atomically (return (4 :: Int));
+
+testCreateTVar = runIO $ atomically (newTVar "Test" `bind` (\tv -> 
+            writeTVar tv "Foo" `anonymousBind`
+            readTVar tv
+            ));
+
+//testFirstSucceeds =
+//    let first = return (1 :: Int);
+//        second = return (2 :: Int);
+//    in atomically (first `orElse` second);
+//
+//testSecondSucceeds =
+//    let first = retry `anonymousBind` return (1 :: Int);
+//        second = return (2 :: Int);
+//    in atomically (first `orElse` second);
+
+// Santa Example from Beautiful Code
+
+data Group = Group capacity :: Int state :: (TVar (Int, Gate, Gate)) name :: String;
+
+newGroup :: String -> Int -> IO Group;
+newGroup name n =
+    atomically (
+        newGate (name ++ "-in") n `bind` (\!g1 ->
+            newGate (name ++ "-out") n `bind` (\!g2 ->
+                newNamedTVar (n, g1, g2) name `bind` (\!tv ->
+                    return (Group n tv name)))));
+
+joinGroup :: Group -> IO (Gate, Gate);
+joinGroup group =
+    let Group n tv name = group;
+    in atomically (
+        readTVar tv `bind` (\!state ->
+            let (left, g1, g2) = state; in checkBecause ("group " ++ name ++ " already full") (left > 0) `anonymousBind`
+            writeTVar tv (left-1,g1,g2) `anonymousBind`
+            return (g1,g2)));
+
+awaitGroup :: Group -> STM (Gate, Gate);
+awaitGroup group =
+    let Group n tv name = group;
+    in readTVar tv `bind` (\!state ->
+        let (left, g1, g2) = state; in checkBecause ("group " ++ name ++ " not full") (left == 0) `anonymousBind`
+        newGate (name ++ "-in") n `bind` (\!newG1 ->
+        newGate (name ++ "-out") n `bind` (\!newG2 ->
+        writeTVar tv (n,newG1,newG2) `anonymousBind`
+        return (g1,g2))));
+
+data Gate = Gate capacity :: Int remainingCapacity :: (TVar Int);
+
+newGate :: String -> Int -> STM Gate;
+newGate name n = newNamedTVar 0 name `bind` (\!tv -> return (Gate n tv));
+
+passGate :: Gate -> IO ();
+passGate gate =
+    let Gate n tv = gate;
+    in atomically (readTVar tv `bind` (\!left ->
+       checkBecause "gate closed" (left > 0) `anonymousBind`
+       writeTVar tv (left-1)));
+
+operateGate :: Gate -> IO ();
+operateGate gate =
+    let Gate n tv = gate;
+    in atomically (writeTVar tv n) `anonymousBind`
+       atomically (readTVar tv `bind` (\!left -> checkBecause "not all through gate" (left == 0)));
+
+helper1 :: Group -> IO () -> IO ();
+helper1 group task =
+    joinGroup group `bind` (\!gates ->
+    let (ingate, outgate) = gates; 
+    in passGate ingate `anonymousBind`
+    task `anonymousBind`
+    randomDelay `anonymousBind`
+    passGate outgate);
+
+elf1 :: Group -> Int -> IO ();
+elf1 group id = helper1 group (meetInStudy id);
+
+reindeer1 :: Group -> Int -> IO ();
+reindeer1 group id = randomDelay `anonymousBind` helper1 group (deliverToys id);
+
+meetInStudy :: Int -> IO ();
+meetInStudy id = putStr ("Elf " ++ (show id) ++ " meeting in the study.\n");
+
+deliverToys :: Int -> IO ();
+deliverToys id = putStr ("Reindeer " ++ (show id) ++ " delivering toys.\n");
+
+forever :: IO () -> IO ();
+forever act = act `anonymousBind` (forever act);
+
+randomDelay :: IO ();
+randomDelay = IO (\s -> (s,sleep (abs ((head $ randomLongs getSystemTime) % 1000)) ()));
+               
+
+elf :: Group -> Int -> IO ();
+elf group id = forever (elf1 group id );
+
+reindeer :: Group -> Int -> IO ();
+reindeer group id = forever (reindeer1 group id);
+
+santa :: Group -> Group -> IO ();
+santa elves reindeer =
+    let
+        chooseGroup :: Group -> String -> STM (String, (Gate,Gate));
+        chooseGroup group task =
+            awaitGroup group `bind` (\gates -> return (task, gates));
+    in
+        putStr "----------\n" `anonymousBind`
+        (atomically (orElse
+                     (chooseGroup reindeer "deliver toys")
+                     (chooseGroup elves "meet in my office")
+                     )) `bind`
+        (\!t -> let (task, gates) = t; (inGate, outGate) = gates;
+               in putStr ("Ho! Ho! Ho! let's " ++ task ++ "!\n") `anonymousBind`
+               operateGate inGate `anonymousBind`
+               operateGate outGate)
+        ;
+
+startHelpers :: String -> (Int -> IO ()) -> Int -> IO ();
+startHelpers type helper n =
+    if n == 0 then return ()
+    else (runIO $ setCurrentThreadName (type ++ " " ++ (show n)) `anonymousBind` helper n) `par`
+          (startHelpers type helper (n-1));
+    
+mainSanta :: IO ();
+mainSanta =  setLogLevel logWARNING `anonymousBind`
+        setCurrentThreadName "santa" `anonymousBind`
+        newGroup "elves" 3 `bind` (\!elfGroup ->
+        newGroup "reindeer" 9 `bind` (\!reindeerGroup ->
+        startHelpers "elf" (elf elfGroup) 12 `anonymousBind`
+        startHelpers "reindeer" (reindeer reindeerGroup) 9 `anonymousBind`
+        forever (santa elfGroup reindeerGroup)))
+        ;
+
+allTests = runIO (testSimpleTransfer `anonymousBind` testTransfer1 `anonymousBind` testTransfer2 /*`anonymousBind` mainSanta*/);
+
+
+philosopher :: String -> TVar Boolean -> TVar Boolean -> IO ();
+philosopher name fork1 fork2 =  setCurrentThreadName name `anonymousBind`
+                                (forever $
+                                putStr (name ++ " is thinking.\n") `anonymousBind`
+                                getForks fork1 fork2 `anonymousBind` 
+                                putStr (name ++ " is eating...") `anonymousBind`
+                                randomDelay `anonymousBind`
+                                putStr (name ++ " released the forks\n") `anonymousBind`
+                                releaseForks fork1 fork2);
+
+getForks :: TVar Boolean -> TVar Boolean -> IO ();
+getForks f1 f2 =
+    atomically $
+    readTVar f1 `bind` (\leftFree ->
+    check leftFree `anonymousBind`
+    readTVar f2 `bind` (\rightFree ->
+    check rightFree `anonymousBind`
+    writeTVar f1 False `anonymousBind`
+    writeTVar f2 False));
+
+releaseForks :: TVar Boolean -> TVar Boolean -> IO ();
+releaseForks f1 f2 =
+    atomically $   
+    writeTVar f1 True `anonymousBind`
+    writeTVar f2 True;
+
+mainPhil :: IO ();
+public mainPhil =
+    let   createForks :: IO [TVar Boolean];
+          createForks = sequence $ map (\n -> atomically $ newTVar True) philosophersNames;
+          philosophersNames = ["Plato", "Rand", "Heidegger", "Kant", "Tom"];
+          createBlockMain = atomically $ newTVar False;
+          startPhilosophers :: [String] -> [TVar Boolean] -> Int -> IO ();
+          startPhilosophers names forks index =
+              case names of
+                  [] -> return ();
+                  n:ns -> (runIO $ philosopher n (subscript forks index) (subscript forks ((index + 1) % 5))) 
+                              `par` 
+                          startPhilosophers ns forks (index+1);
+              ;
+    in
+        createForks `bind` (\forks ->
+        startPhilosophers philosophersNames forks 0) `anonymousBind`
+        createBlockMain `bind` (\blockMain ->
+        atomically (readTVar blockMain `bind` (\complete -> check complete)));
+
+
+
+
+

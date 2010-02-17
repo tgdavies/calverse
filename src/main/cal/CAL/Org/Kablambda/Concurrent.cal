@@ -1,0 +1,19 @@
+module Org.Kablambda.Concurrent;
+
+import Cal.Core.Prelude using
+    typeConstructor = String;
+    ;
+
+import Org.Kablambda.IO using
+    typeConstructor = IO;
+    dataConstructor = IO;
+    ;
+
+data foreign unsafe import jvm "java.lang.Thread" private Thread;
+foreign unsafe import jvm "static method java.lang.Thread.currentThread"
+    private currentThread :: Thread;
+foreign unsafe import jvm "method setName" private setThreadName :: Thread -> String -> ();
+
+setCurrentThreadName :: String -> IO ();
+public setCurrentThreadName name = IO (\s -> (s,setThreadName currentThread name));
+

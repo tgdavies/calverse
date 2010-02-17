@@ -1,0 +1,67 @@
+/**
+ * Logger provides logging support using the java.util.logging framework.
+ */
+module Org.Kablambda.Logger;
+
+import Cal.Core.Prelude using
+    typeConstructor = String;
+    function = seq;
+    ;
+
+import Org.Kablambda.IO using
+    typeConstructor = IO;
+    dataConstructor = IO;
+    ;
+
+/**
+ * A java.util.logging.Logger
+ */
+data foreign unsafe import jvm "java.util.logging.Logger" public Logger;
+
+/**
+ * A java.util.logging.Level
+ */
+data foreign unsafe import jvm "java.util.logging.Level" public Level;
+data foreign unsafe import jvm "java.util.logging.Handler" private Handler;
+foreign unsafe import jvm "constructor java.util.logging.ConsoleHandler" private consoleHandler :: Handler;
+
+foreign unsafe import jvm "static method java.util.logging.Logger.getLogger"
+    private getLogger :: String -> Logger;
+foreign unsafe import jvm "static field java.util.logging.Level.SEVERE" public logSEVERE :: Level;
+foreign unsafe import jvm "static field java.util.logging.Level.WARNING" public logWARNING :: Level;
+foreign unsafe import jvm "static field java.util.logging.Level.INFO" public logINFO :: Level;
+foreign unsafe import jvm "static field java.util.logging.Level.CONFIG" public logCONFIG :: Level;
+foreign unsafe import jvm "static field java.util.logging.Level.FINE" public logFINE :: Level;
+foreign unsafe import jvm "static field java.util.logging.Level.FINER" public logFINER :: Level;
+foreign unsafe import jvm "static field java.util.logging.Level.FINEST" public logFINEST :: Level;
+foreign unsafe import jvm "method log" private jLog :: Logger -> Level -> String -> ();
+foreign unsafe import jvm "method setLevel" private setLevel :: Logger -> Level -> ();
+foreign unsafe import jvm "method setLevel" private setHandlerLevel :: Handler -> Level -> ();
+foreign unsafe import jvm "method addHandler" private addHandler :: Logger -> Handler -> ();
+
+log :: Logger -> Level -> String -> a -> a;
+public log !logger !level !message a = jLog logger level message `seq` a;
+
+private log2 !level !logger !message a = jLog logger level message `seq` a;
+
+public severe = log2 logSEVERE;
+public warning = log2 logWARNING;
+public info = log2 logINFO;
+public config = log2 logCONFIG;
+public fine = log2 logFINE;
+public finer = log2 logFINER;
+public finest = log2 logFINEST;
+
+private ourConsoleHandler = consoleHandler;
+
+setLogLevel :: Level -> IO ();
+public setLogLevel level = 
+    let rootLogger = getLogger "";
+    in IO (\s -> (s,setLevel rootLogger level `seq`
+        addHandler rootLogger ourConsoleHandler `seq`
+        setHandlerLevel ourConsoleHandler level));
+
+
+
+
+
